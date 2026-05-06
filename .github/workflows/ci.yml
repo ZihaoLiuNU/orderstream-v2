@@ -1,0 +1,101 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  # 第一步：编译 + 单元测试
+  build:
+    name: Build & Test
+    runs-on: ubuntu-latest
+
+    services:
+      # CI 环境中启动 PostgreSQL 容器，集成测试使用真实数据库
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_DB: orderstream_test
+          POSTGRES_USER: orderstream
+          POSTGRES_PASSWORD: orderstream
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 配置 Java 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+          cache: maven  # 缓存 Maven 依赖，加速后续构建
+
+      - name: 编译并运行测试
+        run: mvn verify -q
+        env:
+          SPRING_DATASOURCE_URL: jdbc:postgresql://localhost:5432/orderstream_test
+
+      - name: 上传测试报告
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: test-reports
+          path: target/surefire-reports/
+
+  # 第二步：构建并推送 Docker 镜像
+  docker:
+    name: Build & Push Docker Image
+    runs-on: ubuntu-latest
+    needs: build  # 测试通过后才构建镜像
+    if: github.ref == 'refs/heads/main'  # 仅 main 分支触发
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 登录 Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+      - name: 构建并推送镜像
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          # 使用 git commit hash 作为镜像标签，保证每次部署可追溯
+          tags: |
+            ${{ secrets.DOCKER_USERNAME }}/orderstream:latest
+            ${{ secrets.DOCKER_USERNAME }}/orderstream:${{ github.sha }}
+
+  # 第三步：部署到 AWS App Runner（零停机发布）
+  deploy:
+    name: Deploy to AWS App Runner
+    runs-on: ubuntu-latest
+    needs: docker
+    if: github.ref == 'refs/heads/main'
+
+    steps:
+      - name: 配置 AWS 凭证
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: us-east-1
+
+      - name: 部署到 App Runner
+        run: |
+          # 触发 App Runner 拉取最新镜像并滚动部署（自动零停机）
+          aws apprunner start-deployment \
+            --service-arn ${{ secrets.APP_RUNNER_SERVICE_ARN }}
+          echo "部署已触发，App Runner 正在滚动更新..."

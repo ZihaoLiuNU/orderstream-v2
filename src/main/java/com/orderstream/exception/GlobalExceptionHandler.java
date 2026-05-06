@@ -2,6 +2,7 @@ package com.orderstream.exception;
 
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
+import org.springframework.security.access.AccessDeniedException;
 import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.RestControllerAdvice;
 
@@ -26,6 +27,16 @@ public class GlobalExceptionHandler {
                 "timestamp", LocalDateTime.now().toString(),
                 "status", 400,
                 "error", ex.getMessage()
+        ));
+    }
+
+    // RBAC 权限不足时返回统一格式的 403，而非 Spring Security 默认的 HTML 错误页
+    @ExceptionHandler(AccessDeniedException.class)
+    public ResponseEntity<Map<String, Object>> handleAccessDenied(AccessDeniedException ex) {
+        return ResponseEntity.status(HttpStatus.FORBIDDEN).body(Map.of(
+                "timestamp", LocalDateTime.now().toString(),
+                "status", 403,
+                "error", "权限不足，无法执行此操作"
         ));
     }
 }
