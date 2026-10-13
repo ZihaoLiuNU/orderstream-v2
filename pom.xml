@@ -4,6 +4,23 @@
          xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
     <modelVersion>4.0.0</modelVersion>
 
+    <!--
+      父 POM：packaging=pom 表示它自己不产出 jar，只负责聚合子模块和统一管理版本。
+
+      为什么微服务还用 Maven 多模块（monorepo）而不是每个服务一个仓库？
+        - 多仓库(polyrepo)的真实成本是：共享的事件契约(common)一改，要在 N 个仓库里
+          发版、升版本号、等依赖同步，跨服务的原子性变更几乎不可能。
+        - monorepo 让「改契约 + 改所有消费方」可以在一个 commit 里完成，CI 一次跑完。
+        - 代价：仓库会变大，且需要构建缓存/增量构建来避免每次全量编译。
+        - 注意：monorepo ≠ 单体。这里每个模块产出独立的可执行 jar 和独立的 Docker 镜像，
+          独立部署、独立数据库，部署拓扑仍然是微服务。
+    -->
+    <groupId>com.orderstream</groupId>
+    <artifactId>orderstream-parent</artifactId>
+    <version>1.0.0</version>
+    <packaging>pom</packaging>
+    <name>orderstream-parent</name>
+
     <parent>
         <groupId>org.springframework.boot</groupId>
         <artifactId>spring-boot-starter-parent</artifactId>
@@ -11,50 +28,84 @@
         <relativePath/>
     </parent>
 
-    <groupId>com.orderstream</groupId>
-    <artifactId>orderstream</artifactId>
-    <version>0.0.1-SNAPSHOT</version>
-    <name>orderstream</name>
+    <modules>
+        <module>common</module>
+        <module>messaging</module>
+        <module>api-gateway</module>
+        <module>auth-service</module>
+        <module>menu-service</module>
+        <module>cart-service</module>
+        <module>order-service</module>
+        <module>payment-service</module>
+        <module>notification-service</module>
+    </modules>
 
     <properties>
-        <java.version>17</java.version>
+        <!--
+          Java 21（LTS）。选它不只是因为新：
+          虚拟线程（Project Loom）让「一个请求一个线程」的阻塞式写法重新变得廉价。
+          传统 Tomcat 平台线程池默认 200 个，每个线程 ~1MB 栈，阻塞在 IO 上就是纯浪费；
+          虚拟线程由 JVM 调度，阻塞时自动卸载挂起，几万个并发连接也不会耗尽内存。
+          这直接影响本项目的并发上限 —— 见各服务 application.yml 里的
+          spring.threads.virtual.enabled=true
+        -->
+        <java.version>21</java.version>
+        <!-- Spring Cloud 2023.0.x 是与 Spring Boot 3.2.x 对应的版本线，版本不匹配会在启动时直接报错 -->
+        <spring-cloud.version>2023.0.0</spring-cloud.version>
+        <!-- jjwt 0.12.x：0.11 的 API 已废弃多年。安全库保持在维护线上本身就是基本功 -->
+        <jjwt.version>0.12.6</jjwt.version>
+        <testcontainers.version>1.19.3</testcontainers.version>
     </properties>
 
+    <dependencyManagement>
+        <dependencies>
+            <!-- 只声明版本，不引入依赖；子模块 <dependencies> 里引用时就不用写 version -->
+            <dependency>
+                <groupId>org.springframework.cloud</groupId>
+                <artifactId>spring-cloud-dependencies</artifactId>
+                <version>${spring-cloud.version}</version>
+                <type>pom</type>
+                <scope>import</scope>
+            </dependency>
+            <dependency>
+                <groupId>org.testcontainers</groupId>
+                <artifactId>testcontainers-bom</artifactId>
+                <version>${testcontainers.version}</version>
+                <type>pom</type>
+                <scope>import</scope>
+            </dependency>
+            <dependency>
+                <groupId>com.orderstream</groupId>
+                <artifactId>common</artifactId>
+                <version>${project.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>com.orderstream</groupId>
+                <artifactId>messaging</artifactId>
+                <version>${project.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>io.jsonwebtoken</groupId>
+                <artifactId>jjwt-api</artifactId>
+                <version>${jjwt.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>io.jsonwebtoken</groupId>
+                <artifactId>jjwt-impl</artifactId>
+                <version>${jjwt.version}</version>
+                <scope>runtime</scope>
+            </dependency>
+            <dependency>
+                <groupId>io.jsonwebtoken</groupId>
+                <artifactId>jjwt-jackson</artifactId>
+                <version>${jjwt.version}</version>
+                <scope>runtime</scope>
+            </dependency>
+        </dependencies>
+    </dependencyManagement>
+
     <dependencies>
-        <dependency>
-            <groupId>org.springframework.boot</groupId>
-            <artifactId>spring-boot-starter-web</artifactId>
-        </dependency>
-        <dependency>
-            <groupId>org.springframework.boot</groupId>
-            <artifactId>spring-boot-starter-security</artifactId>
-        </dependency>
-        <dependency>
-            <groupId>org.springframework.boot</groupId>
-            <artifactId>spring-boot-starter-data-jpa</artifactId>
-        </dependency>
-        <dependency>
-            <groupId>org.postgresql</groupId>
-            <artifactId>postgresql</artifactId>
-            <scope>runtime</scope>
-        </dependency>
-        <dependency>
-            <groupId>io.jsonwebtoken</groupId>
-            <artifactId>jjwt-api</artifactId>
-            <version>0.11.5</version>
-        </dependency>
-        <dependency>
-            <groupId>io.jsonwebtoken</groupId>
-            <artifactId>jjwt-impl</artifactId>
-            <version>0.11.5</version>
-            <scope>runtime</scope>
-        </dependency>
-        <dependency>
-            <groupId>io.jsonwebtoken</groupId>
-            <artifactId>jjwt-jackson</artifactId>
-            <version>0.11.5</version>
-            <scope>runtime</scope>
-        </dependency>
+        <!-- 所有模块都需要的：Lombok(编译期生成 getter/builder) + 测试框架 -->
         <dependency>
             <groupId>org.projectlombok</groupId>
             <artifactId>lombok</artifactId>
@@ -65,31 +116,25 @@
             <artifactId>spring-boot-starter-test</artifactId>
             <scope>test</scope>
         </dependency>
-        <dependency>
-            <groupId>org.springframework.kafka</groupId>
-            <artifactId>spring-kafka</artifactId>
-        </dependency>
-        <!-- AOP：用于 API 请求日志切面（记录接口耗时，支撑性能监控）-->
-        <dependency>
-            <groupId>org.springframework.boot</groupId>
-            <artifactId>spring-boot-starter-aop</artifactId>
-        </dependency>
     </dependencies>
 
     <build>
-        <plugins>
-            <plugin>
-                <groupId>org.springframework.boot</groupId>
-                <artifactId>spring-boot-maven-plugin</artifactId>
-                <configuration>
-                    <excludes>
-                        <exclude>
-                            <groupId>org.projectlombok</groupId>
-                            <artifactId>lombok</artifactId>
-                        </exclude>
-                    </excludes>
-                </configuration>
-            </plugin>
-        </plugins>
+        <pluginManagement>
+            <plugins>
+                <plugin>
+                    <groupId>org.springframework.boot</groupId>
+                    <artifactId>spring-boot-maven-plugin</artifactId>
+                    <configuration>
+                        <!-- Lombok 只在编译期需要，打进 jar 是死重量 -->
+                        <excludes>
+                            <exclude>
+                                <groupId>org.projectlombok</groupId>
+                                <artifactId>lombok</artifactId>
+                            </exclude>
+                        </excludes>
+                    </configuration>
+                </plugin>
+            </plugins>
+        </pluginManagement>
     </build>
 </project>

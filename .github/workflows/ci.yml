@@ -1,4 +1,4 @@
-name: CI/CD Pipeline
+name: CI/CD
 
 on:
   push:
@@ -6,96 +6,205 @@ on:
   pull_request:
     branches: [ main ]
 
+# 同一分支的新提交会取消正在跑的旧流水线。
+# 没有这个的话，连续推 3 次会有 3 条流水线同时跑，
+# 既浪费 runner 额度，又让"最新提交的状态"变得不确定
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  JAVA_VERSION: '21'
+
 jobs:
-  # 第一步：编译 + 单元测试
-  build:
-    name: Build & Test
+  # ==========================================================================
+  # 第 1 步：编译 + 单元测试
+  # ==========================================================================
+  build-and-test:
+    name: 构建与单元测试
     runs-on: ubuntu-latest
 
-    services:
-      # CI 环境中启动 PostgreSQL 容器，集成测试使用真实数据库
-      postgres:
-        image: postgres:15
-        env:
-          POSTGRES_DB: orderstream_test
-          POSTGRES_USER: orderstream
-          POSTGRES_PASSWORD: orderstream
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd pg_isready
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
-
     steps:
-      - name: 检出代码
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: 配置 Java 17
+      - name: 配置 Java 21
         uses: actions/setup-java@v4
         with:
-          java-version: '17'
-          distribution: 'temurin'
-          cache: maven  # 缓存 Maven 依赖，加速后续构建
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: temurin
+          cache: maven   # 缓存 ~/.m2，后续构建能省几分钟
 
-      - name: 编译并运行测试
-        run: mvn verify -q
-        env:
-          SPRING_DATASOURCE_URL: jdbc:postgresql://localhost:5432/orderstream_test
+      # 单元测试【不需要】数据库和 Kafka。
+      #
+      # 【这是刻意的设计，不是省事】：
+      #   所有业务逻辑（状态机、Saga 编排、库存扣减、支付幂等）
+      #   都写在可以纯 mock 测试的 Service/Entity 里，
+      #   @KafkaListener 只是一层极薄的委托。
+      #
+      #   好处是这一步能在 1 分钟内跑完，开发者本地随时能跑。
+      #   如果业务逻辑写在监听器里，测它就必须启动 Kafka，
+      #   测试会慢到没人愿意在本地跑 —— 然后大家就不写测试了。
+      - name: 编译 + 单元测试
+        run: ./mvnw -B verify
 
       - name: 上传测试报告
         uses: actions/upload-artifact@v4
-        if: always()
+        if: always()   # 失败时更需要看报告
         with:
-          name: test-reports
-          path: target/surefire-reports/
+          name: surefire-reports
+          path: '**/target/surefire-reports/'
+          retention-days: 7
 
-  # 第二步：构建并推送 Docker 镜像
-  docker:
-    name: Build & Push Docker Image
+  # ==========================================================================
+  # 第 2 步：端到端冒烟测试（真实启动全部 10 个容器）
+  # ==========================================================================
+  e2e:
+    name: 端到端冒烟测试
     runs-on: ubuntu-latest
-    needs: build  # 测试通过后才构建镜像
-    if: github.ref == 'refs/heads/main'  # 仅 main 分支触发
+    needs: build-and-test
 
     steps:
-      - name: 检出代码
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: 登录 Docker Hub
-        uses: docker/login-action@v3
+      # 【为什么必须有这一步，即使单元测试全绿】
+      #   单元测试验证的是"我写的逻辑对不对"；
+      #   端到端测试验证的是"我对框架和基础设施的理解对不对"。
+      #
+      #   本项目实际踩到的几个坑，单元测试一个都发现不了：
+      #     - @Bean List<NewTopic> 不被 KafkaAdmin 识别，topic 静默不创建
+      #     - Redis 序列化缺少类型信息，缓存命中时反序列化失败
+      #     - Alpine 的 musl libc 加载不了 snappy 的原生库
+      #     - CHAR vs VARCHAR 导致 Hibernate schema 校验失败
+      #
+      #   这些全都是"编译通过、单测全绿、一跑就炸"。
+      - name: 生成 .env
+        run: |
+          echo "JWT_SECRET=$(openssl rand -base64 48)" > .env
+          echo "POSTGRES_PASSWORD=orderstream" >> .env
+
+      - name: 启动全部服务
+        run: docker compose up -d --build
+
+      - name: 等待服务健康
+        run: |
+          for i in $(seq 1 60); do
+            UNHEALTHY=$(docker compose ps --format '{{.Status}}' | grep -cv 'healthy' || true)
+            if [ "$UNHEALTHY" = "0" ]; then echo "全部健康"; exit 0; fi
+            echo "等待中... ($UNHEALTHY 个未就绪)"
+            sleep 10
+          done
+          echo "服务未能在 10 分钟内全部就绪"
+          docker compose ps
+          exit 1
+
+      - name: 运行冒烟测试
+        run: bash loadtest/smoke-test.sh
+
+      # 失败时把日志捞出来。
+      # 【CI 里最让人抓狂的就是"失败了但看不到原因"】——
+      # 容器在 job 结束时就没了，不主动导出就永远查不到
+      - name: 导出容器日志（失败时）
+        if: failure()
+        run: |
+          mkdir -p logs
+          for c in $(docker compose ps --format '{{.Name}}'); do
+            docker logs "$c" > "logs/$c.log" 2>&1 || true
+          done
+
+      - name: 上传日志
+        uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: container-logs
+          path: logs/
+          retention-days: 7
+
+  # ==========================================================================
+  # 第 3 步：构建并推送镜像（仅 main 分支）
+  # ==========================================================================
+  publish:
+    name: 构建并推送镜像
+    runs-on: ubuntu-latest
+    needs: e2e
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+
+    strategy:
+      # 7 个服务并行构建。
+      # fail-fast: false —— 一个失败时让其他继续跑完，
+      # 这样一次就能看到"到底几个坏了"，而不是修一个发现下一个
+      fail-fast: false
+      matrix:
+        service:
+          - api-gateway
+          - auth-service
+          - menu-service
+          - cart-service
+          - order-service
+          - payment-service
+          - notification-service
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKER_USERNAME }}
           password: ${{ secrets.DOCKER_PASSWORD }}
 
-      - name: 构建并推送镜像
+      - name: 构建并推送 ${{ matrix.service }}
         uses: docker/build-push-action@v5
         with:
           context: .
+          build-args: MODULE=${{ matrix.service }}
           push: true
-          # 使用 git commit hash 作为镜像标签，保证每次部署可追溯
+          # 【用 commit SHA 做标签，而不是只有 latest】
+          #   latest 是可变的：出事故要回滚时，你根本不知道"上一个 latest"是哪个镜像。
+          #   SHA 标签让每次部署都可追溯、可精确回滚到任意历史版本。
+          #   latest 只是给本地开发图方便用的
           tags: |
-            ${{ secrets.DOCKER_USERNAME }}/orderstream:latest
-            ${{ secrets.DOCKER_USERNAME }}/orderstream:${{ github.sha }}
+            ${{ secrets.DOCKER_USERNAME }}/orderstream-${{ matrix.service }}:latest
+            ${{ secrets.DOCKER_USERNAME }}/orderstream-${{ matrix.service }}:${{ github.sha }}
+          # GitHub Actions 缓存层，避免每次都重新下载 Maven 依赖
+          cache-from: type=gha,scope=${{ matrix.service }}
+          cache-to: type=gha,scope=${{ matrix.service }},mode=max
 
-  # 第三步：部署到 AWS App Runner（零停机发布）
+  # ==========================================================================
+  # 第 4 步：部署到 AWS App Runner
+  # ==========================================================================
   deploy:
-    name: Deploy to AWS App Runner
+    name: 部署到 AWS App Runner
     runs-on: ubuntu-latest
-    needs: docker
-    if: github.ref == 'refs/heads/main'
+    needs: publish
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    # environment 让这一步可以配"需要人工审批"，
+    # 并且把 AWS 凭证限定在这个环境里，PR 流水线拿不到
+    environment: production
 
     steps:
-      - name: 配置 AWS 凭证
-        uses: aws-actions/configure-aws-credentials@v4
+      - uses: aws-actions/configure-aws-credentials@v4
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: us-east-1
 
-      - name: 部署到 App Runner
+      # 【零停机是怎么做到的 —— 不是一句口号】
+      #   需要三件事同时成立，缺一不可：
+      #
+      #   1) App Runner 的滚动部署：先起新实例、健康检查通过、
+      #      再把流量切过去、最后停旧实例。任何时刻都有实例在服务
+      #
+      #   2) 应用支持优雅停机：server.shutdown=graceful
+      #      收到 SIGTERM 后先停止接收新请求，等在途请求处理完再退出。
+      #      没有它，切流量的那一刻在途请求会被硬生生掐断，用户看到 502
+      #
+      #   3) 数据库迁移必须向后兼容：新旧版本会【同时运行】一段时间。
+      #      所以绝不能有"删列""改列类型"这种破坏性变更 ——
+      #      必须走 expand-contract：先加新列（兼容期两版本都能跑），
+      #      下个版本再删旧列
+      - name: 触发滚动部署
         run: |
-          # 触发 App Runner 拉取最新镜像并滚动部署（自动零停机）
           aws apprunner start-deployment \
             --service-arn ${{ secrets.APP_RUNNER_SERVICE_ARN }}
-          echo "部署已触发，App Runner 正在滚动更新..."
+          echo "已触发部署，App Runner 正在滚动更新"

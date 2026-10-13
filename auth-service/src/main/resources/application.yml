@@ -1,0 +1,186 @@
+spring:
+  application:
+    name: auth-service
+
+  # ------------------------------------------------------------------
+  # Java 21 虚拟线程
+  # ------------------------------------------------------------------
+  # 打开后，Tomcat 不再用固定大小的平台线程池，而是【每个请求一个虚拟线程】。
+  #
+  # 为什么这对本项目很关键：
+  #   传统模型下 Tomcat 默认 200 个平台线程。请求在等数据库/等下游服务时，
+  #   线程只是挂着，什么也不干，但内存和调度开销照付（每个平台线程约 1MB 栈）。
+  #   并发一旦超过 200，第 201 个请求就只能在队列里排着。
+  #
+  #   虚拟线程由 JVM 调度：遇到阻塞式 IO 时，JVM 把它从底层的载体线程上【卸载】，
+  #   载体线程立刻去跑别的虚拟线程。几万个并发请求也只需要几个载体线程。
+  #
+  # 重要前提（必须知道，否则会踩坑）：
+  #   虚拟线程解决的是【线程数】瓶颈，不解决【资源】瓶颈。
+  #   数据库连接池还是 10 个，虚拟线程再多也得排队等连接。
+  #   它把「线程耗尽」这个瓶颈挪走了，让真正的瓶颈（连接池/下游服务）暴露出来。
+  #
+  #   另外：synchronized 块里发生阻塞会把载体线程一起【钉住】(pinning)，
+  #   虚拟线程的优势就没了。Java 21 里这是个真实限制（Java 24 修复了），
+  #   所以代码里要用 ReentrantLock 而不是 synchronized 包裹阻塞操作。
+  threads:
+    virtual:
+      enabled: true
+
+  datasource:
+    url: ${SPRING_DATASOURCE_URL:jdbc:postgresql://localhost:5432/auth_db}
+    username: ${SPRING_DATASOURCE_USERNAME:orderstream}
+    password: ${SPRING_DATASOURCE_PASSWORD:orderstream}
+    hikari:
+      # 连接池大小的经验公式（HikariCP 官方 wiki）：
+      #     连接数 = (CPU 核心数 * 2) + 有效磁盘数
+      #
+      # 反直觉但正确：连接池【越大越慢】。
+      #   真正能并行执行 SQL 的能力受限于 CPU 核数和磁盘 IO 能力。
+      #   连接开多了，只是把排队从连接池挪进了数据库内部，
+      #   还额外付出上下文切换开销 + Postgres 每个连接一个 OS 进程的内存代价
+      #   （Postgres 是 process-per-connection，不是 thread-per-connection，这点和 MySQL 不同）。
+      #   小池 + 排队的整体吞吐和延迟反而更好，本质是 Little's Law。
+      maximum-pool-size: ${DB_POOL_SIZE:10}
+      minimum-idle: 2
+
+      # 拿不到连接时等多久就放弃。
+      # 原版是 30000ms，这是个真实的错误配置：
+      #   在流量高峰下，大量请求会各自傻等 30 秒才失败，
+      #   用户体验是「整站卡死」而不是「快速报错」。
+      #   而且这些等待中的请求占着 Tomcat 线程，形成线程饥饿，故障被放大。
+      # 2 秒快速失败(fail fast)远好于 30 秒慢速失败：
+      #   调用方能立刻重试或降级，队列不会无限堆积。
+      connection-timeout: 2000
+
+      idle-timeout: 600000       # 空闲 10 分钟回收
+      max-lifetime: 1800000      # 连接最长存活 30 分钟。
+                                 # 必须【小于】数据库端和中间件(如 AWS RDS Proxy、pgbouncer)的超时时间，
+                                 # 否则会拿到已被对端关闭的死连接，表现为随机的 "connection reset"
+      leak-detection-threshold: 20000   # 连接借出超过 20 秒未归还就打警告，用来抓连接泄漏
+
+  jpa:
+    hibernate:
+      # validate 而不是 update。
+      # schema 由 Flyway 管理，Hibernate 只负责【校验】实体和表是否匹配。
+      # 一旦实体和迁移脚本不一致，启动时立刻失败 —— 这正是我们想要的：
+      # 在部署阶段炸，而不是在半夜某个查询跑到那个字段时炸。
+      ddl-auto: validate
+    # 生产必须关。开着的话每条 SQL 都打日志，
+    # 高并发下日志 IO 会成为真实的性能瓶颈，而且日志文件瞬间撑爆磁盘
+    show-sql: false
+    open-in-view: false
+    # open-in-view 默认是 true，而且 Spring Boot 启动时会打一条警告。必须关掉，原因：
+    #   它让 Hibernate Session 一直开到视图渲染结束，意味着数据库连接在整个请求期间都被占着，
+    #   包括序列化 JSON 的时间。连接池利用率直接崩溃。
+    #   它还会掩盖 LazyInitializationException —— 让你误以为代码没问题，
+    #   实际上在 Controller 之外触发了额外的 N+1 查询。
+    properties:
+      hibernate:
+        jdbc:
+          batch_size: 50          # 批量插入时合并成一条多值 INSERT，减少网络往返
+        order_inserts: true
+        order_updates: true
+
+  flyway:
+    enabled: true
+    # baseline-on-migrate：允许在一个【已有数据但没有 flyway 历史表】的库上首次启用 Flyway
+    baseline-on-migrate: true
+
+  # ------------------------------------------------------------------
+  # 【@Scheduled 的线程池 —— 默认只有 1 个线程，这是个真实踩过的坑】
+  # ------------------------------------------------------------------
+  # Spring Boot 的 TaskScheduler 默认 pool size = 1，
+  # 意味着一个服务里【所有】 @Scheduled 任务共用一个线程，串行执行。
+  #
+  # 我踩到的现象：
+  #   压测后留下 3 万个卡死的 Saga，StuckSagaSweeper 一次性把它们
+  #   全部载入并逐个补偿，单次执行耗时 3 分半。
+  #   在这 3 分半里，OutboxRelay 【一次都没被调度】——
+  #   5 万条待发事件完全停滞，attempt_count 一直是 0。
+  #
+  #   表现出来是"Outbox 坏了"，实际上是"Outbox 根本没机会运行"。
+  #   排查时非常有迷惑性：relay 的代码、配置、Kafka 连接全都正常。
+  #
+  # 【教训】
+  #   只要一个应用里有多于一个 @Scheduled 任务，就必须显式配置线程池。
+  #   否则任何一个任务变慢，都会静默地饿死其他所有任务 ——
+  #   而且它们之间【本来毫无关系】，这种耦合完全是隐式的。
+  #
+  #   这也是"资源隔离"思想的一个体现：
+  #   不相关的工作不该共享一个可能被耗尽的资源。
+  task:
+    scheduling:
+      pool:
+        size: 5
+      thread-name-prefix: scheduled-
+
+  lifecycle:
+    # 优雅停机的等待上限。超过这个时间还没处理完的请求会被强制中断
+    timeout-per-shutdown-phase: 20s
+
+server:
+  port: ${SERVER_PORT:8081}
+  shutdown: graceful   # 收到 SIGTERM 后先停止接收新请求，等在途请求处理完再退出。
+                       # 这是零停机部署的前提之一：滚动更新时，
+                       # 旧实例必须把手上的请求做完才能死，否则用户会看到 502
+
+orderstream:
+  seed-data:
+    # 【这个配置项之前漏了，导致种子数据静默不生效】
+    #
+    # DevDataInitializer 上的 @ConditionalOnProperty 要求
+    # orderstream.seed-data.enabled=true 才会创建 Bean。
+    # 属性【完全不存在】时，havingValue="true" 的条件不满足，
+    # Bean 直接不被创建 —— 而且不会有任何日志或警告。
+    #
+    # 我在 docker-compose 里设了 SEED_DATA_ENABLED=true，
+    # 但这里没有把它绑定到 orderstream.seed-data.enabled，
+    # 所以那个环境变量根本没人读。
+    #
+    # 【教训】：环境变量和配置项之间的映射必须显式声明。
+    # 只在 compose 里设变量、却没在 yml 里引用它，是很容易犯的错，
+    # 因为两边分开看都"没问题"。
+    enabled: ${SEED_DATA_ENABLED:false}
+    # 压测需要的账号数量
+    user-count: ${SEED_USER_COUNT:1000}
+
+jwt:
+  # 绝不硬编码。没有环境变量时给一个明显是占位符的默认值，
+  # 这样本地能跑起来，但任何人看到这个值都知道它不能上生产
+  secret: ${JWT_SECRET:local-dev-only-secret-do-not-use-in-production-min-32-bytes}
+  # access token 短效：它不可撤销，只能靠短 TTL 限制泄露后的损失窗口
+  access-token-ttl: 15m
+  # refresh token 长效但可撤销（存在数据库里，见 RefreshToken 实体）
+  refresh-token-ttl: 7d
+
+management:
+  endpoints:
+    web:
+      exposure:
+        # 只暴露这三个。绝不要用 "*"：
+        # /actuator/env 会打印所有环境变量（包括数据库密码和 JWT 密钥），
+        # /actuator/heapdump 直接把整个堆内存 dump 出来（里面有明文密码和 token）。
+        # 这是真实发生过的大规模数据泄露原因
+        include: health,info,prometheus
+  endpoint:
+    health:
+      # 只对内网展示详细信息。details 里包含数据库连接串、磁盘路径等内部拓扑信息
+      show-details: when-authorized
+      probes:
+        enabled: true   # 启用 /health/liveness 和 /health/readiness，K8s 探针用
+  metrics:
+    tags:
+      application: ${spring.application.name}   # 所有指标自动打上服务名标签，方便在 Grafana 里按服务筛选
+
+logging:
+  level:
+    com.orderstream: INFO
+    # 需要排查 SQL 时打开下面两行（只在本地）：
+    # org.hibernate.SQL: DEBUG
+    # org.hibernate.orm.jdbc.bind: TRACE
+  pattern:
+    # 日志里带上 correlationId（由网关注入、经 MDC 传递），
+    # 这样同一次用户请求在 7 个服务里产生的日志可以被串起来。
+    # 没有它的话，微服务排障基本是不可能的
+    console: "%d{HH:mm:ss.SSS} %-5level [%X{correlationId:-no-cid}] %logger{36} - %msg%n"

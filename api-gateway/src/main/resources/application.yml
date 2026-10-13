@@ -1,0 +1,174 @@
+spring:
+  application:
+    name: api-gateway
+
+  data:
+    redis:
+      host: ${SPRING_DATA_REDIS_HOST:localhost}
+      port: ${SPRING_DATA_REDIS_PORT:6379}
+      timeout: 1s    # Redis 超时必须短。限流用的 Redis 一旦变慢，
+                     # 每个请求都要等它，网关就跟着一起慢 ——
+                     # 「为了保护系统而加的组件，自己成了故障源」是很常见的反模式
+
+  cloud:
+    gateway:
+      # ----------------------------------------------------------------
+      # 路由表：按路径前缀把请求转到对应服务
+      # ----------------------------------------------------------------
+      # uri 里的主机名就是 docker-compose 里的服务名。
+      # Docker 内置 DNS 会把它解析成容器 IP，K8s 里同理（Service DNS）。
+      # 这就是最简单可靠的服务发现 —— 不需要 Eureka/Consul。
+      # Eureka 是给「没有平台级服务发现」的环境用的，在 Docker/K8s 里引入它
+      # 只会多一个要运维、要高可用、会出故障的组件。
+      routes:
+        - id: auth-service
+          uri: http://auth-service:8080
+          predicates:
+            - Path=/api/auth/**
+          filters:
+            # 认证接口严格限流，防撞库/爆破
+            - name: RequestRateLimiter
+              args:
+                key-resolver: "#{@ipKeyResolver}"
+                # 令牌桶：稳态每秒补充 5 个令牌，桶容量 10。
+                # 容量 > 速率 的意义是允许【短暂突发】：
+                # 用户打开 App 时可能同时触发几个请求，不该被限流误伤。
+                # 但持续的高频请求会很快耗尽桶里的令牌，被降到 5/秒
+                # ================================================
+                # 【限流阈值做成可配置，是为了压测 —— 这是标准做法】
+                # ================================================
+                # 压测的目的是测出【系统的真实容量】。
+                # 如果限流阈值远低于系统容量，那压测测到的就是限流器的阈值，
+                # 而不是系统能扛多少 —— 数字毫无参考价值。
+                #
+                # 正确的顺序是：
+                #   1) 先把限流放开，压出系统的真实容量（比如 150 单/秒开始劣化）
+                #   2) 再把限流阈值设在容量【之下】（比如 100 单/秒），留出安全余量
+                #
+                # 反过来做（先拍一个限流值，再压测）是本末倒置：
+                # 你永远不知道自己离悬崖还有多远。
+                redis-rate-limiter.replenishRate: ${RL_AUTH_RATE:5}
+                redis-rate-limiter.burstCapacity: ${RL_AUTH_BURST:10}
+                redis-rate-limiter.requestedTokens: 1
+
+        - id: menu-service
+          uri: http://menu-service:8080
+          predicates:
+            - Path=/api/restaurants/**,/api/menu-items/**
+          filters:
+            - name: RequestRateLimiter
+              args:
+                key-resolver: "#{@userOrIpKeyResolver}"
+                # 浏览菜单是只读且会被缓存的，限制可以宽松
+                redis-rate-limiter.replenishRate: ${RL_MENU_RATE:50}
+                redis-rate-limiter.burstCapacity: ${RL_MENU_BURST:100}
+
+        - id: cart-service
+          uri: http://cart-service:8080
+          predicates:
+            - Path=/api/cart/**
+          filters:
+            - name: RequestRateLimiter
+              args:
+                key-resolver: "#{@userOrIpKeyResolver}"
+                redis-rate-limiter.replenishRate: ${RL_CART_RATE:30}
+                redis-rate-limiter.burstCapacity: ${RL_CART_BURST:60}
+
+        - id: order-service
+          uri: http://order-service:8080
+          predicates:
+            - Path=/api/orders/**
+          filters:
+            - name: RequestRateLimiter
+              args:
+                key-resolver: "#{@userOrIpKeyResolver}"
+                # 下单是写操作、会触发 Saga、有真实成本，限得最严。
+                # 注意：限流【不能】替代幂等性。
+                # 限流防的是「恶意的大量请求」，幂等防的是「正常的重复请求」
+                # （用户手抖点两次、客户端超时自动重试）。两者解决的是不同问题，
+                # 都必须有。见 order-service 的 Idempotency-Key 实现
+                redis-rate-limiter.replenishRate: ${RL_ORDER_RATE:10}
+                redis-rate-limiter.burstCapacity: ${RL_ORDER_BURST:20}
+
+        - id: payment-service
+          uri: http://payment-service:8080
+          predicates:
+            - Path=/api/payments/**
+
+        - id: notification-service
+          uri: http://notification-service:8080
+          predicates:
+            - Path=/api/notifications/**
+
+      # ----------------------------------------------------------------
+      # 对所有路由生效的默认过滤器
+      # ----------------------------------------------------------------
+      default-filters:
+        # 下游服务返回 5xx 或超时时，网关这一层做有限重试。
+        # 只对【幂等方法】重试 —— 这是绝对不能搞错的：
+        #   GET/HEAD/OPTIONS 天然幂等，重试安全。
+        #   POST 不幂等，自动重试 POST /api/orders 会产生重复订单。
+        #   很多人图省事把 methods 全填上，结果在下游超时时批量产生重复数据，
+        #   而且极难排查（因为下游其实成功了，只是响应慢）
+        - name: Retry
+          args:
+            retries: 2
+            methods: GET
+            series: SERVER_ERROR
+            # 指数退避：50ms -> 100ms -> 200ms。
+            # 固定间隔重试在下游过载时会形成「重试风暴」，
+            # 把本来只是慢的下游彻底打死。退避是给下游喘息的机会
+            backoff:
+              firstBackoff: 50ms
+              maxBackoff: 500ms
+              factor: 2
+              basedOnPreviousValue: false
+
+      httpclient:
+        # 连接下游的超时。3 秒连不上说明下游挂了或网络有问题，没必要继续等
+        connect-timeout: 3000
+        # 下游响应超时。这个值必须【大于】下游自己的处理超时，
+        # 否则网关会在下游还在正常处理时就断开，产生「幽灵请求」：
+        # 用户看到失败，但下单其实成功了
+        response-timeout: 10s
+
+  lifecycle:
+    timeout-per-shutdown-phase: 20s
+
+server:
+  port: ${SERVER_PORT:8080}
+  shutdown: graceful
+
+jwt:
+  # 和 auth-service 用同一把密钥（HS256 对称签名）。
+  # 见 JwtIssuer 里关于「为什么生产应该改用 RS256 非对称签名」的讨论
+  secret: ${JWT_SECRET:local-dev-only-secret-do-not-use-in-production-min-32-bytes}
+
+orderstream:
+  gateway:
+    # 网关层的粗粒度 ADMIN 校验。
+    # 这【不是】唯一防线 —— order-service 里还有一层 @PreAuthorize，
+    # 因为路径规则会在重构时静默失效（见 DownstreamSecuritySupport 的注释）
+    #
+    # 写成逗号分隔的字符串而不是 YAML 列表，是因为 @Value 只支持前者。
+    # YAML 列表要用 @ConfigurationProperties 才能绑定 —— 这是个常见的困惑点：
+    # @Value("${some.list}") 注入 List<String> 时，Spring 走的是
+    # 「按逗号切分字符串」的转换器，YAML 的 - 语法它认不出来，会直接报找不到属性
+    admin-only-paths: /api/orders/*/status,/api/restaurants/*/menu-items
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,prometheus,gateway
+  endpoint:
+    health:
+      show-details: when-authorized
+      probes:
+        enabled: true
+
+logging:
+  level:
+    com.orderstream: INFO
+  pattern:
+    console: "%d{HH:mm:ss.SSS} %-5level [%X{correlationId:-no-cid}] %logger{36} - %msg%n"

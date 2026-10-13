@@ -1,15 +1,28 @@
+### 构建产物 ###
 target/
 *.class
-*.jar
-*.war
-*.ear
 
+### IDE ###
 .idea/
 *.iml
 *.iws
 *.ipr
 .vscode/
 
-*.log
+### Claude Code 本地配置 ###
+.claude/
 
+### 密钥：绝不提交 ###
 .env
+*.pem
+*.key
+
+### 日志 / 压测结果 ###
+*.log
+logs/
+loadtest/results/
+
+### 本地笔记：不上传 ###
+docs/
+INTERVIEW_PREP.md
+CLAUDE.md

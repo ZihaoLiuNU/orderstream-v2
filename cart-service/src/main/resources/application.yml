@@ -1,0 +1,73 @@
+spring:
+  application:
+    name: cart-service
+
+  threads:
+    virtual:
+      enabled: true
+
+  # 注意：没有 datasource 配置。cart-service 不用关系数据库。
+  # 见 CartServiceApplication 里关于 Polyglot Persistence 的说明
+  data:
+    redis:
+      host: ${SPRING_DATA_REDIS_HOST:localhost}
+      port: ${SPRING_DATA_REDIS_PORT:6379}
+      # 【Redis 在这里是关键路径依赖，不是可选的缓存】
+      # 它是购物车的唯一存储，挂了购物车功能就不可用 —— 这和 menu-service
+      # 里"Redis 只是缓存、挂了可以降级到数据库"完全不同。
+      # 所以超时可以给得稍宽松一点（1 秒），因为没有降级路径可走，
+      # 快速失败并不能让功能可用，只是更快地告诉用户失败了
+      timeout: 1s
+      lettuce:
+        pool:
+          max-active: 16
+          max-idle: 8
+          min-idle: 2
+
+  kafka:
+    bootstrap-servers: ${SPRING_KAFKA_BOOTSTRAP_SERVERS:localhost:9092}
+    consumer:
+      group-id: cart-service
+      auto-offset-reset: earliest
+      enable-auto-commit: false
+      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      value-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+    listener:
+      # 清空购物车是纯 Redis 操作，极快，不需要高并发
+      concurrency: 3
+    producer:
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.apache.kafka.common.serialization.StringSerializer
+
+  lifecycle:
+    timeout-per-shutdown-phase: 20s
+
+server:
+  port: ${SERVER_PORT:8083}
+  shutdown: graceful
+
+orderstream:
+  cart:
+    # ISO-8601 duration：P7D = 7 天。
+    # 每次写操作都会刷新（滑动过期），所以语义是"7 天无操作才过期"
+    ttl: P7D
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,prometheus
+  endpoint:
+    health:
+      show-details: when-authorized
+      probes:
+        enabled: true
+  metrics:
+    tags:
+      application: ${spring.application.name}
+
+logging:
+  level:
+    com.orderstream: INFO
+  pattern:
+    console: "%d{HH:mm:ss.SSS} %-5level [%X{correlationId:-no-cid}] %logger{36} - %msg%n"

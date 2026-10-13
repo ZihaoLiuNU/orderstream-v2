@@ -1,0 +1,84 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <groupId>com.orderstream</groupId>
+        <artifactId>orderstream-parent</artifactId>
+        <version>1.0.0</version>
+    </parent>
+
+    <artifactId>api-gateway</artifactId>
+    <name>api-gateway</name>
+
+    <!--
+      网关是整个系统里唯一的【响应式】服务，这是刻意的。
+
+      为什么网关必须是响应式（WebFlux / Netty），而其他服务是 Servlet（Tomcat）：
+        网关的工作是纯 IO 转发 —— 收一个请求、转发到下游、等、把响应写回去。
+        它自己几乎不做 CPU 计算，绝大部分时间都在【等下游】。
+        用 Servlet 模型的话，每个在途请求占住一个平台线程干等，Tomcat 默认 200 线程，
+        下游一慢就直接打满，网关自己先倒了 —— 而网关倒了整个系统就全挂了。
+        WebFlux 用事件循环，几个线程就能扛住上万个在途连接，等待不占线程。
+
+      注意：Spring Cloud Gateway 和 spring-boot-starter-web 不能共存。
+      两者都在 classpath 上时 Spring Boot 会自动选 Servlet 栈，网关启动直接报错：
+      "Spring MVC found on classpath, which is incompatible with Spring Cloud Gateway"
+      这也是 common 模块把 spring-webmvc 标成 optional 的原因。
+    -->
+    <dependencies>
+        <dependency>
+            <groupId>com.orderstream</groupId>
+            <artifactId>common</artifactId>
+        </dependency>
+
+        <dependency>
+            <groupId>org.springframework.cloud</groupId>
+            <artifactId>spring-cloud-starter-gateway</artifactId>
+        </dependency>
+
+        <!-- 网关自己不连数据库，只做【无状态的 JWT 签名验证】：
+             用同一把密钥验签，验过就信任 token 里的 claim。
+             不查库是关键 —— 否则每个请求都多一次 DB 往返，网关就成了新瓶颈 -->
+        <dependency>
+            <groupId>io.jsonwebtoken</groupId>
+            <artifactId>jjwt-api</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>io.jsonwebtoken</groupId>
+            <artifactId>jjwt-impl</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>io.jsonwebtoken</groupId>
+            <artifactId>jjwt-jackson</artifactId>
+        </dependency>
+
+        <!-- 网关层限流。用 Redis 做令牌桶，因为限流状态必须跨网关实例共享：
+             如果每个实例各限各的，扩容 3 个实例就等于把限流阈值放大了 3 倍 -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-data-redis-reactive</artifactId>
+        </dependency>
+
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-actuator</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>io.micrometer</groupId>
+            <artifactId>micrometer-registry-prometheus</artifactId>
+            <scope>runtime</scope>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <plugins>
+            <plugin>
+                <groupId>org.springframework.boot</groupId>
+                <artifactId>spring-boot-maven-plugin</artifactId>
+            </plugin>
+        </plugins>
+    </build>
+</project>

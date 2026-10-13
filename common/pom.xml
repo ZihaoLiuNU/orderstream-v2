@@ -1,0 +1,92 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <groupId>com.orderstream</groupId>
+        <artifactId>orderstream-parent</artifactId>
+        <version>1.0.0</version>
+    </parent>
+
+    <artifactId>common</artifactId>
+    <name>common</name>
+
+    <!--
+      共享模块的纪律（常见质疑：「微服务还搞 shared library，不是又耦合了吗？」）：
+
+      这里只放【契约】，绝不放【业务逻辑】：
+        ✅ 事件 schema（Kafka 消息的形状，本来就是生产者和消费者共享的）
+        ✅ topic 名常量（打错字是编译期发现还是运行期静默丢消息，差别很大）
+        ✅ HTTP header 名常量（网关注入、下游读取，两边必须一致）
+        ✅ 通用异常 + 统一错误响应格式（对外 API 契约的一部分）
+        ❌ 不放 Service、不放 Entity、不放任何领域规则
+
+      理由：事件 schema 是【定义上就共享】的东西。不放 common 的唯一替代是在每个服务里
+      复制一份，结果必然是字段漂移——生产者加了字段，消费者不知道。把它变成编译期依赖，
+      契约一改，所有消费方立刻编译失败，这正是我们想要的。
+
+      真正的耦合风险在于：common 一改，所有服务都得重新构建部署。所以 common 必须保持
+      极小且极稳定。一旦发现想往里塞业务代码，说明边界划错了。
+    -->
+    <dependencies>
+        <dependency>
+            <groupId>com.fasterxml.jackson.core</groupId>
+            <artifactId>jackson-databind</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>com.fasterxml.jackson.datatype</groupId>
+            <artifactId>jackson-datatype-jsr310</artifactId>
+        </dependency>
+
+        <!--
+          optional=true 的作用：这两个依赖不会传递给依赖 common 的模块。
+
+          为什么必须这样：api-gateway 用的是 WebFlux（响应式），而 spring-webmvc 是 Servlet 栈。
+          两者同时出现在 classpath 上，Spring Boot 会自动选 MVC 并让 Spring Cloud Gateway
+          直接启动失败。optional 让只有【自己也引入了 web starter】的 MVC 服务才拿到这些类。
+        -->
+        <dependency>
+            <groupId>org.springframework</groupId>
+            <artifactId>spring-webmvc</artifactId>
+            <optional>true</optional>
+        </dependency>
+        <dependency>
+            <groupId>org.springframework</groupId>
+            <artifactId>spring-web</artifactId>
+            <optional>true</optional>
+        </dependency>
+        <!-- GlobalExceptionHandler 用到 HttpServletRequest。
+             provided 语义：编译期需要，运行期由容器(Tomcat)提供，不打进 jar，也不传递给下游模块 -->
+        <dependency>
+            <groupId>jakarta.servlet</groupId>
+            <artifactId>jakarta.servlet-api</artifactId>
+            <scope>provided</scope>
+        </dependency>
+        <!-- Lombok 的 @Slf4j 在编译期生成 private static final Logger 字段，需要 slf4j-api 在 classpath 上 -->
+        <dependency>
+            <groupId>org.slf4j</groupId>
+            <artifactId>slf4j-api</artifactId>
+        </dependency>
+
+        <!-- 下游服务共享的「身份头 -> SecurityContext」过滤器需要这两个。
+             同样标 optional：api-gateway 是响应式栈，用的是 spring-security-web 的 reactive 部分，
+             不需要这里的 Servlet 版本 -->
+        <dependency>
+            <groupId>org.springframework.security</groupId>
+            <artifactId>spring-security-web</artifactId>
+            <optional>true</optional>
+        </dependency>
+        <dependency>
+            <groupId>org.springframework.security</groupId>
+            <artifactId>spring-security-config</artifactId>
+            <optional>true</optional>
+        </dependency>
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-autoconfigure</artifactId>
+            <optional>true</optional>
+        </dependency>
+    </dependencies>
+</project>

@@ -1,0 +1,140 @@
+spring:
+  application:
+    name: menu-service
+
+  threads:
+    virtual:
+      enabled: true
+
+  datasource:
+    url: ${SPRING_DATASOURCE_URL:jdbc:postgresql://localhost:5432/menu_db}
+    username: ${SPRING_DATASOURCE_USERNAME:orderstream}
+    password: ${SPRING_DATASOURCE_PASSWORD:orderstream}
+    hikari:
+      # menu-service 是读密集型（浏览菜单）+ Saga 写入（扣库存）。
+      # 池子比 auth 稍大，因为除了 HTTP 请求，还有 Kafka 消费线程
+      # (concurrency=3) 和定时任务（OutboxRelay、StaleReservationSweeper）
+      # 在同时借连接。
+      #
+      # 【这是个真实的容量陷阱】：只按 HTTP 并发算池子大小，
+      # 会漏掉后台线程的需求，结果是定时任务偶发地拿不到连接。
+      # 算法应该是：HTTP 需要的 + 消费者并发数 + 定时任务数 + 余量
+      maximum-pool-size: ${DB_POOL_SIZE:15}
+      minimum-idle: 3
+      connection-timeout: 2000        # fail fast，不要让请求傻等 30 秒
+      idle-timeout: 600000
+      max-lifetime: 1800000
+      leak-detection-threshold: 20000
+
+  jpa:
+    hibernate:
+      ddl-auto: validate     # schema 由 Flyway 管，Hibernate 只校验
+    show-sql: false
+    open-in-view: false      # 必须关，见 auth-service 里的说明
+    properties:
+      hibernate:
+        jdbc:
+          batch_size: 50
+        order_inserts: true
+        order_updates: true
+
+  flyway:
+    enabled: true
+    baseline-on-migrate: true
+
+  data:
+    redis:
+      host: ${SPRING_DATA_REDIS_HOST:localhost}
+      port: ${SPRING_DATA_REDIS_PORT:6379}
+      # 超时必须短。缓存是优化性依赖，它慢了必须快速失败并降级到数据库，
+      # 而不是让每个请求都陪着它一起等
+      timeout: 500ms
+      lettuce:
+        pool:
+          max-active: 16
+          max-idle: 8
+          min-idle: 2
+
+  kafka:
+    bootstrap-servers: ${SPRING_KAFKA_BOOTSTRAP_SERVERS:localhost:9092}
+    consumer:
+      # 这个值同时是 ProcessedEvent 表里的 consumer 字段，
+      # 也是 @KafkaListener 上 groupId 的默认值。三处必须一致
+      group-id: menu-service
+
+  # ------------------------------------------------------------------
+  # 【@Scheduled 的线程池 —— 默认只有 1 个线程，这是个真实踩过的坑】
+  # ------------------------------------------------------------------
+  # Spring Boot 的 TaskScheduler 默认 pool size = 1，
+  # 意味着一个服务里【所有】 @Scheduled 任务共用一个线程，串行执行。
+  #
+  # 我踩到的现象：
+  #   压测后留下 3 万个卡死的 Saga，StuckSagaSweeper 一次性把它们
+  #   全部载入并逐个补偿，单次执行耗时 3 分半。
+  #   在这 3 分半里，OutboxRelay 【一次都没被调度】——
+  #   5 万条待发事件完全停滞，attempt_count 一直是 0。
+  #
+  #   表现出来是"Outbox 坏了"，实际上是"Outbox 根本没机会运行"。
+  #   排查时非常有迷惑性：relay 的代码、配置、Kafka 连接全都正常。
+  #
+  # 【教训】
+  #   只要一个应用里有多于一个 @Scheduled 任务，就必须显式配置线程池。
+  #   否则任何一个任务变慢，都会静默地饿死其他所有任务 ——
+  #   而且它们之间【本来毫无关系】，这种耦合完全是隐式的。
+  #
+  #   这也是"资源隔离"思想的一个体现：
+  #   不相关的工作不该共享一个可能被耗尽的资源。
+  task:
+    scheduling:
+      pool:
+        size: 5
+      thread-name-prefix: scheduled-
+
+  lifecycle:
+    timeout-per-shutdown-phase: 20s
+
+server:
+  port: ${SERVER_PORT:8082}
+  shutdown: graceful
+
+orderstream:
+  kafka:
+    # 消费并发度。必须 <= topic 的分区数(6)，否则多出的线程永远空闲。
+    # 这是原版代码最大的吞吐瓶颈：默认值 1 意味着单线程消费
+    consumer-concurrency: 3
+
+  outbox:
+    relay:
+      enabled: true
+      interval: 500       # 轮询间隔(ms)，决定事件投递的额外延迟
+      batch-size: 100
+      send-timeout: 5s
+
+  stock:
+    # Saga 卡死的判定阈值。正常流程 < 2 秒，这里留了几百倍余量防误杀。
+    # ISO-8601 duration 格式：PT10M = 10 分钟
+    stale-reservation-timeout: PT10M
+    sweep-interval: 60000
+
+  seed-data:
+    enabled: ${SEED_DATA_ENABLED:false}
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,prometheus
+  endpoint:
+    health:
+      show-details: when-authorized
+      probes:
+        enabled: true
+  metrics:
+    tags:
+      application: ${spring.application.name}
+
+logging:
+  level:
+    com.orderstream: INFO
+  pattern:
+    console: "%d{HH:mm:ss.SSS} %-5level [%X{correlationId:-no-cid}] %logger{36} - %msg%n"
