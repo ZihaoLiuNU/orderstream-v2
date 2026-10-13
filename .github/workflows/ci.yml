@@ -143,17 +143,32 @@ jobs:
           - payment-service
           - notification-service
 
+    # 【没配 secrets 时跳过，而不是让流水线变红】
+    #   job 级 if 里不能直接读 secrets，所以先放进 env，再在 step 级判断。
+    #   fork 出来的仓库 / 还没开 Docker Hub 账号时，前两步（测试 + 冒烟）照样能把关；
+    #   配上 DOCKER_USERNAME / DOCKER_PASSWORD 后自动生效，无需改 workflow
+    env:
+      DOCKER_CONFIGURED: ${{ secrets.DOCKER_USERNAME != '' && secrets.DOCKER_PASSWORD != '' }}
+
     steps:
+      - name: 未配置 Docker Hub 凭证，跳过推送
+        if: env.DOCKER_CONFIGURED != 'true'
+        run: echo "::notice::未配置 DOCKER_USERNAME / DOCKER_PASSWORD，跳过镜像推送"
+
       - uses: actions/checkout@v4
+        if: env.DOCKER_CONFIGURED == 'true'
 
       - uses: docker/setup-buildx-action@v3
+        if: env.DOCKER_CONFIGURED == 'true'
 
       - uses: docker/login-action@v3
+        if: env.DOCKER_CONFIGURED == 'true'
         with:
           username: ${{ secrets.DOCKER_USERNAME }}
           password: ${{ secrets.DOCKER_PASSWORD }}
 
       - name: 构建并推送 ${{ matrix.service }}
+        if: env.DOCKER_CONFIGURED == 'true'
         uses: docker/build-push-action@v5
         with:
           context: .
@@ -182,8 +197,17 @@ jobs:
     # 并且把 AWS 凭证限定在这个环境里，PR 流水线拿不到
     environment: production
 
+    # 同上：没配 AWS 凭证时跳过部署，而不是失败
+    env:
+      AWS_CONFIGURED: ${{ secrets.AWS_ACCESS_KEY_ID != '' && secrets.APP_RUNNER_SERVICE_ARN != '' }}
+
     steps:
+      - name: 未配置 AWS 凭证，跳过部署
+        if: env.AWS_CONFIGURED != 'true'
+        run: echo "::notice::未配置 AWS_ACCESS_KEY_ID / APP_RUNNER_SERVICE_ARN，跳过部署"
+
       - uses: aws-actions/configure-aws-credentials@v4
+        if: env.AWS_CONFIGURED == 'true'
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
@@ -204,6 +228,7 @@ jobs:
       #      必须走 expand-contract：先加新列（兼容期两版本都能跑），
       #      下个版本再删旧列
       - name: 触发滚动部署
+        if: env.AWS_CONFIGURED == 'true'
         run: |
           aws apprunner start-deployment \
             --service-arn ${{ secrets.APP_RUNNER_SERVICE_ARN }}
