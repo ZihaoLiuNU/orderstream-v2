@@ -82,8 +82,14 @@ jobs:
           echo "JWT_SECRET=$(openssl rand -base64 48)" > .env
           echo "POSTGRES_PASSWORD=orderstream" >> .env
 
+      # 构建和启动分成两步：失败时一眼能看出是"镜像没构建出来"还是"容器没起来"
+      - name: 构建镜像
+        run: docker compose build
+
+      # 启动失败时重试一次：runner 资源紧张时依赖的健康检查偶发超时，
+      # 已经起来的容器不会被重建，第二次 up 只会补齐没起来的那几个
       - name: 启动全部服务
-        run: docker compose up -d --build
+        run: docker compose up -d || (sleep 30 && docker compose up -d)
 
       - name: 等待服务健康
         run: |
